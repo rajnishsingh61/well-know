@@ -5,6 +5,7 @@ import asyncio
 import uuid
 import logging
 import threading
+import aiohttp
 
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -38,8 +39,7 @@ TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 COOLDOWN = int(os.getenv("COOLDOWN_SECONDS", "14"))
 BATCH_SIZE = int(os.getenv("BATCH_SIZE", "10"))
 
-# Render automatically provides PORT.
-# Local fallback = 10000.
+# Render automatically provides PORT. Local fallback = 10000.
 PORT = int(os.getenv("PORT", "10000"))
 
 logging.basicConfig(
@@ -91,7 +91,6 @@ class HealthHandler(BaseHTTPRequestHandler):
             self.wfile.write(body)
 
     def log_message(self, format, *args):
-        # HTTP request logs ko spam hone se rokta hai.
         return
 
 
@@ -192,43 +191,47 @@ def status_text(j):
 
 
 # =========================
-# AUTHORIZED / TEST API
+# REAL API INTEGRATION
 # =========================
 
-async def mock_authorized_api(
+async def fetch_real_api(
     name_prefix,
     password_prefix,
     count,
 ):
     """
-    Safe test data source.
-
-    Replace this only with an API that you own
-    or are explicitly authorized to use.
+    Fetches dynamic data asynchronously from Vercel API.
     """
-
-    await asyncio.sleep(1)
-
-    records = []
-
-    for _ in range(count):
-        records.append(
-            {
-                "uid": (
-                    "TEST-"
-                    + uuid.uuid4().hex[:10]
-                ),
-                "password": (
-                    password_prefix
-                    + uuid.uuid4().hex[:8]
-                ),
-            }
-        )
-
-    return {
-        "success": True,
-        "data": records,
+    url = f"https://guestidgen.vercel.app/api/generate/{count}"
+    params = {
+        "name": name_prefix,
+        "password": password_prefix,
     }
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, params=params, timeout=15) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+
+                    if isinstance(data, list):
+                        records = data
+                    elif isinstance(data, dict):
+                        records = data.get("data", data.get("results", []))
+                    else:
+                        records = []
+
+                    return {
+                        "success": True,
+                        "data": records,
+                    }
+                else:
+                    logging.error("API Error Status: %s", resp.status)
+                    return {"success": False, "data": []}
+
+    except Exception as error:
+        logging.exception("API Request failed: %s", error)
+        return {"success": False, "data": []}
 
 
 # =========================
@@ -504,8 +507,7 @@ async def worker(uid, app):
             )
 
             try:
-
-                response = await mock_authorized_api(
+                response = await fetch_real_api(
                     j["name_prefix"],
                     j["password_prefix"],
                     batch,
@@ -518,14 +520,22 @@ async def worker(uid, app):
 
                 j["success"] += 1
 
-                for item in response.get(
-                    "data",
-                    [],
-                ):
+                for item in response.get("data", []):
+                    # Maps 'garena_uid' to 'uid' field
+                    record_uid = (
+                        item.get("garena_uid")
+                        or item.get("uid") 
+                        or item.get("id") 
+                        or item.get("username")
+                    )
+                    record_pwd = (
+                        item.get("password") 
+                        or item.get("pass")
+                    )
 
                     record = {
-                        "uid": item.get("uid"),
-                        "password": item.get("password"),
+                        "uid": record_uid,
+                        "password": record_pwd,
                     }
 
                     if not record["uid"]:
@@ -538,14 +548,9 @@ async def worker(uid, app):
 
                     seen.add(record["uid"])
 
-                    j["records"].append(
-                        record
-                    )
+                    j["records"].append(record)
 
-                    if (
-                        len(j["records"])
-                        >= j["target"]
-                    ):
+                    if len(j["records"]) >= j["target"]:
                         break
 
                 await app.bot.send_message(
@@ -574,7 +579,7 @@ async def worker(uid, app):
 
                 continue
 
-            # 14 second cooldown
+            # Cooldown execution
             for left in range(
                 COOLDOWN,
                 0,
@@ -608,7 +613,6 @@ async def worker(uid, app):
             reply_markup=menu(),
         )
 
-        # Direct JSON delivery
         sent = await send_json_to_chat(
             uid,
             app,
@@ -630,13 +634,13 @@ async def worker(uid, app):
 
 
 # =========================
-# JSON
+# JSON GENERATION
 # =========================
 
 def json_bytes(j):
 
     payload = {
-        "dataset_type": "authorized/test",
+        "dataset_type": "generated/api",
         "count": len(j["records"]),
         "success_requests": j["success"],
         "failed_requests": j["failed"],
@@ -731,7 +735,6 @@ def main():
             "TELEGRAM_BOT_TOKEN .env me set karo."
         )
 
-    # Start Render HTTP health server
     health_thread = threading.Thread(
         target=start_health_server,
         daemon=True,
@@ -739,7 +742,6 @@ def main():
 
     health_thread.start()
 
-    # Start Telegram bot
     application = (
         Application.builder()
         .token(TOKEN)
