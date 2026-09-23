@@ -4,8 +4,11 @@ import json
 import asyncio
 import uuid
 import logging
+import threading
 
 from datetime import datetime, timezone
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
 from dotenv import load_dotenv
 
 from telegram import (
@@ -35,6 +38,10 @@ TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 COOLDOWN = int(os.getenv("COOLDOWN_SECONDS", "14"))
 BATCH_SIZE = int(os.getenv("BATCH_SIZE", "10"))
 
+# Render automatically provides PORT.
+# Local fallback = 10000.
+PORT = int(os.getenv("PORT", "10000"))
+
 logging.basicConfig(
     format="%(asctime)s - %(levelname)s - %(message)s",
     level=logging.INFO,
@@ -42,6 +49,64 @@ logging.basicConfig(
 
 jobs = {}
 locks = {}
+
+
+# =========================
+# RENDER HEALTH SERVER
+# =========================
+
+class HealthHandler(BaseHTTPRequestHandler):
+
+    def do_GET(self):
+        if self.path in ("/", "/health", "/healthz"):
+            body = b"OK"
+
+            self.send_response(200)
+            self.send_header(
+                "Content-Type",
+                "text/plain; charset=utf-8",
+            )
+            self.send_header(
+                "Content-Length",
+                str(len(body)),
+            )
+            self.end_headers()
+
+            self.wfile.write(body)
+
+        else:
+            body = b"Not Found"
+
+            self.send_response(404)
+            self.send_header(
+                "Content-Type",
+                "text/plain; charset=utf-8",
+            )
+            self.send_header(
+                "Content-Length",
+                str(len(body)),
+            )
+            self.end_headers()
+
+            self.wfile.write(body)
+
+    def log_message(self, format, *args):
+        # HTTP request logs ko spam hone se rokta hai.
+        return
+
+
+def start_health_server():
+    server = ThreadingHTTPServer(
+        ("0.0.0.0", PORT),
+        HealthHandler,
+    )
+
+    logging.info(
+        "Health server listening on 0.0.0.0:%s",
+        PORT,
+    )
+
+    server.serve_forever()
 
 
 # =========================
@@ -138,7 +203,7 @@ async def mock_authorized_api(
     """
     Safe test data source.
 
-    Replace this function only with an API that you own
+    Replace this only with an API that you own
     or are explicitly authorized to use.
     """
 
@@ -167,7 +232,7 @@ async def mock_authorized_api(
 
 
 # =========================
-# START COMMAND
+# START
 # =========================
 
 async def start(
@@ -195,7 +260,7 @@ async def start(
 
 
 # =========================
-# TEXT INPUT WIZARD
+# TEXT INPUT
 # =========================
 
 async def text_handler(
@@ -208,6 +273,7 @@ async def text_handler(
     value = update.message.text.strip()
 
     if j["state"] == "name":
+
         if not value:
             await update.message.reply_text(
                 "Name prefix empty nahi ho sakta."
@@ -222,6 +288,7 @@ async def text_handler(
         )
 
     elif j["state"] == "password":
+
         if not value:
             await update.message.reply_text(
                 "Password prefix empty nahi ho sakta."
@@ -236,8 +303,10 @@ async def text_handler(
         )
 
     elif j["state"] == "count":
+
         try:
             count = int(value)
+
         except ValueError:
             await update.message.reply_text(
                 "⚠️ Count number me bhejo."
@@ -279,7 +348,7 @@ async def text_handler(
 
 
 # =========================
-# CALLBACK BUTTONS
+# CALLBACKS
 # =========================
 
 async def callback_handler(
@@ -287,12 +356,14 @@ async def callback_handler(
     context: ContextTypes.DEFAULT_TYPE,
 ):
     query = update.callback_query
+
     await query.answer()
 
     uid = query.from_user.id
     j = get_job(uid)
 
     if query.data == "new":
+
         if j["state"] == "running":
             await query.message.reply_text(
                 "⚠️ Pehle running job stop karo."
@@ -300,6 +371,7 @@ async def callback_handler(
             return
 
         reset_job(j)
+
         j["state"] = "name"
 
         await query.message.reply_text(
@@ -307,6 +379,7 @@ async def callback_handler(
         )
 
     elif query.data == "cancel":
+
         reset_job(j)
 
         await query.message.reply_text(
@@ -315,6 +388,7 @@ async def callback_handler(
         )
 
     elif query.data == "startjob":
+
         if j["state"] == "running":
             await query.message.reply_text(
                 "⚠️ Job already running hai."
@@ -361,27 +435,34 @@ async def callback_handler(
         )
 
     elif query.data == "status":
+
         await query.message.reply_text(
             status_text(j),
             reply_markup=menu(),
         )
 
     elif query.data == "stop":
+
         if j["state"] == "running":
+
             j["stop"] = True
 
             await query.message.reply_text(
                 "🛑 Stop requested.\n"
                 "Current request finish hone ke baad JSON send hoga."
             )
+
         else:
+
             await query.message.reply_text(
                 "ℹ️ Koi running job nahi hai.",
                 reply_markup=menu(),
             )
 
     elif query.data == "json":
+
         if not j["records"]:
+
             await query.message.reply_text(
                 "⚠️ Abhi koi record available nahi hai.",
                 reply_markup=menu(),
@@ -399,6 +480,7 @@ async def callback_handler(
 # =========================
 
 async def worker(uid, app):
+
     j = get_job(uid)
 
     seen = {
@@ -408,10 +490,12 @@ async def worker(uid, app):
     }
 
     async with locks[uid]:
+
         while (
             len(j["records"]) < j["target"]
             and not j["stop"]
         ):
+
             j["request_no"] += 1
 
             batch = min(
@@ -420,6 +504,7 @@ async def worker(uid, app):
             )
 
             try:
+
                 response = await mock_authorized_api(
                     j["name_prefix"],
                     j["password_prefix"],
@@ -433,7 +518,11 @@ async def worker(uid, app):
 
                 j["success"] += 1
 
-                for item in response.get("data", []):
+                for item in response.get(
+                    "data",
+                    [],
+                ):
+
                     record = {
                         "uid": item.get("uid"),
                         "password": item.get("password"),
@@ -448,9 +537,15 @@ async def worker(uid, app):
                         continue
 
                     seen.add(record["uid"])
-                    j["records"].append(record)
 
-                    if len(j["records"]) >= j["target"]:
+                    j["records"].append(
+                        record
+                    )
+
+                    if (
+                        len(j["records"])
+                        >= j["target"]
+                    ):
                         break
 
                 await app.bot.send_message(
@@ -459,6 +554,7 @@ async def worker(uid, app):
                 )
 
             except Exception as error:
+
                 j["failed"] += 1
 
                 logging.exception(
@@ -475,14 +571,16 @@ async def worker(uid, app):
                 )
 
                 await asyncio.sleep(3)
+
                 continue
 
-            # Cooldown
+            # 14 second cooldown
             for left in range(
                 COOLDOWN,
                 0,
                 -1,
             ):
+
                 if j["stop"]:
                     break
 
@@ -494,9 +592,6 @@ async def worker(uid, app):
 
         stopped = j["stop"]
 
-        j["state"] = "idle"
-        j["stop"] = False
-
         if stopped:
             title = "🛑 JOB STOPPED"
         else:
@@ -507,7 +602,8 @@ async def worker(uid, app):
             text=(
                 f"{title}\n\n"
                 + status_text(j)
-                + "\n\n📄 account.json send ho raha hai..."
+                + "\n\n"
+                "📄 account.json send ho raha hai..."
             ),
             reply_markup=menu(),
         )
@@ -520,6 +616,7 @@ async def worker(uid, app):
         )
 
         if sent:
+
             reset_job(j)
 
             await app.bot.send_message(
@@ -533,10 +630,11 @@ async def worker(uid, app):
 
 
 # =========================
-# JSON EXPORT
+# JSON
 # =========================
 
 def json_bytes(j):
+
     payload = {
         "dataset_type": "authorized/test",
         "count": len(j["records"]),
@@ -557,9 +655,11 @@ def json_bytes(j):
 
 
 async def send_json(msg, j):
+
     data = json_bytes(j)
 
     file_buffer = io.BytesIO(data)
+
     file_buffer.seek(0)
 
     await msg.reply_document(
@@ -574,11 +674,18 @@ async def send_json(msg, j):
     )
 
 
-async def send_json_to_chat(uid, app, j):
+async def send_json_to_chat(
+    uid,
+    app,
+    j,
+):
+
     try:
+
         data = json_bytes(j)
 
         file_buffer = io.BytesIO(data)
+
         file_buffer.seek(0)
 
         await app.bot.send_document(
@@ -596,6 +703,7 @@ async def send_json_to_chat(uid, app, j):
         return True
 
     except Exception as error:
+
         logging.exception(
             "JSON delivery failed: %s",
             error,
@@ -617,11 +725,21 @@ async def send_json_to_chat(uid, app, j):
 # =========================
 
 def main():
+
     if not TOKEN:
         raise RuntimeError(
             "TELEGRAM_BOT_TOKEN .env me set karo."
         )
 
+    # Start Render HTTP health server
+    health_thread = threading.Thread(
+        target=start_health_server,
+        daemon=True,
+    )
+
+    health_thread.start()
+
+    # Start Telegram bot
     application = (
         Application.builder()
         .token(TOKEN)
@@ -648,7 +766,10 @@ def main():
         )
     )
 
-    logging.info("Bot started.")
+    logging.info(
+        "Bot started. Render PORT=%s",
+        PORT,
+    )
 
     application.run_polling()
 
