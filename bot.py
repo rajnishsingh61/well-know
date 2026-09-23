@@ -2,7 +2,6 @@ import os
 import io
 import json
 import asyncio
-import uuid
 import logging
 import threading
 import aiohttp
@@ -36,8 +35,8 @@ from telegram.ext import (
 load_dotenv()
 
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-COOLDOWN = int(os.getenv("COOLDOWN_SECONDS", "14"))
-BATCH_SIZE = int(os.getenv("BATCH_SIZE", "10"))
+COOLDOWN = int(os.getenv("COOLDOWN_SECONDS", "1"))
+BATCH_SIZE = int(os.getenv("BATCH_SIZE", "50"))
 
 # Render automatically provides PORT. Local fallback = 10000.
 PORT = int(os.getenv("PORT", "10000"))
@@ -191,7 +190,7 @@ def status_text(j):
 
 
 # =========================
-# REAL API INTEGRATION
+# REAL VERCEL API CALL
 # =========================
 
 async def fetch_real_api(
@@ -199,9 +198,6 @@ async def fetch_real_api(
     password_prefix,
     count,
 ):
-    """
-    Fetches dynamic data asynchronously from Vercel API.
-    """
     url = f"https://guestidgen.vercel.app/api/generate/{count}"
     params = {
         "name": name_prefix,
@@ -210,7 +206,7 @@ async def fetch_real_api(
 
     try:
         async with aiohttp.ClientSession() as session:
-            async with session.get(url, params=params, timeout=15) as resp:
+            async with session.get(url, params=params, timeout=25) as resp:
                 if resp.status == 200:
                     data = await resp.json()
 
@@ -226,7 +222,7 @@ async def fetch_real_api(
                         "data": records,
                     }
                 else:
-                    logging.error("API Error Status: %s", resp.status)
+                    logging.error("API returned HTTP status: %s", resp.status)
                     return {"success": False, "data": []}
 
     except Exception as error:
@@ -424,12 +420,6 @@ async def callback_handler(
             asyncio.Lock(),
         )
 
-        await query.message.reply_text(
-            "🚀 Job started.\n\n"
-            + status_text(j),
-            reply_markup=menu(),
-        )
-
         asyncio.create_task(
             worker(
                 uid,
@@ -483,7 +473,6 @@ async def callback_handler(
 # =========================
 
 async def worker(uid, app):
-
     j = get_job(uid)
 
     seen = {
@@ -492,7 +481,19 @@ async def worker(uid, app):
         if record.get("uid")
     }
 
+    status_msg = None
+
     async with locks[uid]:
+
+        # Send initial status message to edit continuously
+        try:
+            status_msg = await app.bot.send_message(
+                chat_id=uid,
+                text="🚀 Job started...\n\n" + status_text(j),
+                reply_markup=menu(),
+            )
+        except Exception as error:
+            logging.exception("Failed to send initial status message: %s", error)
 
         while (
             len(j["records"]) < j["target"]
@@ -514,14 +515,11 @@ async def worker(uid, app):
                 )
 
                 if not response.get("success"):
-                    raise RuntimeError(
-                        "API returned success=false"
-                    )
+                    raise RuntimeError("API returned success=false")
 
                 j["success"] += 1
 
                 for item in response.get("data", []):
-                    # Maps 'garena_uid' to 'uid' field
                     record_uid = (
                         item.get("garena_uid")
                         or item.get("uid") 
@@ -547,50 +545,45 @@ async def worker(uid, app):
                         continue
 
                     seen.add(record["uid"])
-
                     j["records"].append(record)
 
                     if len(j["records"]) >= j["target"]:
                         break
 
-                await app.bot.send_message(
-                    chat_id=uid,
-                    text=status_text(j),
-                )
+                # Edit existing message instead of sending new message
+                if status_msg:
+                    try:
+                        await status_msg.edit_text(
+                            text=status_text(j),
+                            reply_markup=menu(),
+                        )
+                    except Exception:
+                        pass
 
             except Exception as error:
-
                 j["failed"] += 1
+                logging.exception("Request failed: %s", error)
 
-                logging.exception(
-                    "Request failed: %s",
-                    error,
-                )
-
-                await app.bot.send_message(
-                    chat_id=uid,
-                    text=(
-                        f"⚠️ Request #{j['request_no']} failed.\n"
-                        "Retry continue rahega."
-                    ),
-                )
+                if status_msg:
+                    try:
+                        await status_msg.edit_text(
+                            text=(
+                                f"⚠️ Request #{j['request_no']} failed.\n\n"
+                                + status_text(j)
+                            ),
+                            reply_markup=menu(),
+                        )
+                    except Exception:
+                        pass
 
                 await asyncio.sleep(3)
-
                 continue
 
-            # Cooldown execution
-            for left in range(
-                COOLDOWN,
-                0,
-                -1,
-            ):
-
+            # Cooldown logic
+            for left in range(COOLDOWN, 0, -1):
                 if j["stop"]:
                     break
-
                 j["cooldown"] = left
-
                 await asyncio.sleep(1)
 
             j["cooldown"] = 0
@@ -602,33 +595,26 @@ async def worker(uid, app):
         else:
             title = "✅ TARGET COMPLETE"
 
-        await app.bot.send_message(
-            chat_id=uid,
-            text=(
-                f"{title}\n\n"
-                + status_text(j)
-                + "\n\n"
-                "📄 account.json send ho raha hai..."
-            ),
-            reply_markup=menu(),
-        )
+        if status_msg:
+            try:
+                await status_msg.edit_text(
+                    text=(
+                        f"{title}\n\n"
+                        + status_text(j)
+                        + "\n\n"
+                        "📄 account.json send ho raha hai..."
+                    )
+                )
+            except Exception:
+                pass
 
-        sent = await send_json_to_chat(
-            uid,
-            app,
-            j,
-        )
+        sent = await send_json_to_chat(uid, app, j)
 
         if sent:
-
             reset_job(j)
-
             await app.bot.send_message(
                 chat_id=uid,
-                text=(
-                    "✅ account.json delivered.\n"
-                    "Job reset ho gaya."
-                ),
+                text="✅ account.json delivered.\nJob reset ho gaya.",
                 reply_markup=menu(),
             )
 
